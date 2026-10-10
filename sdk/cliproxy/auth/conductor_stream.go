@@ -88,6 +88,54 @@ func validateStreamResult(result *cliproxyexecutor.StreamResult, err error) (*cl
 	return result, nil
 }
 
+func (m *Manager) recordCanceledStreamQuotaResult(ctx context.Context, auth *Auth, provider, model, routeModel string, opts cliproxyexecutor.Options, err error, ephemeral bool) bool {
+	err = markUpstreamExecutionAttemptFromContext(ctx, err)
+	if err == nil || !hasUpstreamExecutionAttempt(err) || statusCodeFromError(err) != http.StatusTooManyRequests || retryAfterFromError(err) == nil || !strings.Contains(strings.ToLower(err.Error()), "usage_limit_reached") {
+		return false
+	}
+	result := Result{
+		AuthID: auth.ID, Provider: provider, Model: model, RouteModel: routeModel,
+		Success: false, Error: resultErrorFromError(err), Options: opts,
+		RetryAfter: retryAfterFromError(err), CredentialScope: isCredentialScopedError(err),
+		CredentialVersion: auth.CredentialVersion, RegistrationEpoch: auth.RegistrationEpoch,
+	}
+	if ctx != nil {
+		ctx = context.WithoutCancel(ctx)
+	}
+	m.recordExecutionResult(ctx, result, auth, ephemeral)
+	return true
+}
+
+func (m *Manager) drainStreamChunksRecordingQuota(ctx context.Context, auth *Auth, provider, model, routeModel string, opts cliproxyexecutor.Options, chunks <-chan cliproxyexecutor.StreamChunk, ephemeral bool) {
+	for chunk := range chunks {
+		if chunk.Err != nil {
+			m.recordCanceledStreamQuotaResult(ctx, auth, provider, model, routeModel, opts, chunk.Err, ephemeral)
+		}
+	}
+}
+
+func (m *Manager) drainQueuedStreamChunksRecordingQuota(ctx context.Context, auth *Auth, provider, model, routeModel string, opts cliproxyexecutor.Options, chunks <-chan cliproxyexecutor.StreamChunk, ephemeral bool) {
+	if chunks == nil {
+		return
+	}
+	queued := len(chunks)
+	for range queued {
+		select {
+		case chunk, ok := <-chunks:
+			if !ok {
+				return
+			}
+			if chunk.Err != nil {
+				m.recordCanceledStreamQuotaResult(ctx, auth, provider, model, routeModel, opts, chunk.Err, ephemeral)
+			}
+		default:
+			go m.drainStreamChunksRecordingQuota(ctx, auth, provider, model, routeModel, opts, chunks, ephemeral)
+			return
+		}
+	}
+	go m.drainStreamChunksRecordingQuota(ctx, auth, provider, model, routeModel, opts, chunks, ephemeral)
+}
+
 func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) ([]cliproxyexecutor.StreamChunk, bool, error) {
 	if ch == nil {
 		return nil, true, nil
@@ -132,17 +180,21 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			rewriter = NewStreamRewriter(StreamRewriteOptions{RewriteModel: aliasResult.OriginalAlias})
 		}
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
-			if chunk.Err != nil && !failed {
-				failed = true
-				entry := logEntryWithRequestID(ctx)
-				warnLogUpstreamFailure(ctx, entry, provider, resultModel, auth, time.Since(streamStart), chunk.Err)
-				rerr := resultErrorFromError(chunk.Err)
-				action, okAction := matchRequestScopedErrorAction(auth, chunk.Err, m.runtimeConfigSnapshot())
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: false, Error: rerr, Options: opts, CredentialVersion: auth.CredentialVersion, RegistrationEpoch: auth.RegistrationEpoch}
-				result.RetryAfter = retryAfterFromError(chunk.Err)
-				result.CredentialScope = isCredentialScopedError(chunk.Err)
-				applyRequestScopedActionToResult(action, okAction, &result)
-				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+			if chunk.Err != nil {
+				if ctx != nil && ctx.Err() != nil && m.recordCanceledStreamQuotaResult(ctx, auth, provider, resultModel, routeModel, opts, chunk.Err, ephemeralResult) {
+					failed = true
+				} else if !failed {
+					failed = true
+					entry := logEntryWithRequestID(ctx)
+					warnLogUpstreamFailure(ctx, entry, provider, resultModel, auth, time.Since(streamStart), chunk.Err)
+					rerr := resultErrorFromError(chunk.Err)
+					action, okAction := matchRequestScopedErrorAction(auth, chunk.Err, m.runtimeConfigSnapshot())
+					result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: false, Error: rerr, Options: opts, CredentialVersion: auth.CredentialVersion, RegistrationEpoch: auth.RegistrationEpoch}
+					result.RetryAfter = retryAfterFromError(chunk.Err)
+					result.CredentialScope = isCredentialScopedError(chunk.Err)
+					applyRequestScopedActionToResult(action, okAction, &result)
+					m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+				}
 			}
 			if !forward {
 				return false
@@ -182,13 +234,30 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		}
 		for _, chunk := range buffered {
 			if ok := emit(chunk); !ok {
-				discardStreamChunks(remaining)
+				m.drainQueuedStreamChunksRecordingQuota(ctx, auth, provider, resultModel, routeModel, opts, remaining, ephemeralResult)
 				return
 			}
 		}
-		for chunk := range remaining {
+		for {
+			var (
+				chunk cliproxyexecutor.StreamChunk
+				ok    bool
+			)
+			if ctx != nil && strings.EqualFold(strings.TrimSpace(provider), "codex") {
+				select {
+				case <-ctx.Done():
+					m.drainQueuedStreamChunksRecordingQuota(ctx, auth, provider, resultModel, routeModel, opts, remaining, ephemeralResult)
+					return
+				case chunk, ok = <-remaining:
+				}
+			} else {
+				chunk, ok = <-remaining
+			}
+			if !ok {
+				break
+			}
 			if ok := emit(chunk); !ok {
-				discardStreamChunks(remaining)
+				m.drainQueuedStreamChunksRecordingQuota(ctx, auth, provider, resultModel, routeModel, opts, remaining, ephemeralResult)
 				return
 			}
 		}
@@ -248,6 +317,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		durationStream := time.Since(startStream)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
+				m.recordCanceledStreamQuotaResult(ctx, auth, provider, resultModel, routeModel, execOpts, errStream, ephemeralResult)
 				return nil, errCtx
 			}
 			if allowRetry && !ephemeralResult {
@@ -269,6 +339,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					if errStream != nil {
 						warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, durationRetry, errStream)
 						if errCtx := ctx.Err(); errCtx != nil {
+							m.recordCanceledStreamQuotaResult(ctx, auth, provider, resultModel, routeModel, execOpts, errStream, ephemeralResult)
 							return nil, errCtx
 						}
 					}
@@ -323,7 +394,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
-				discardStreamChunks(streamResult.Chunks)
+				m.recordCanceledStreamQuotaResult(ctx, auth, provider, resultModel, routeModel, execOpts, bootstrapErr, ephemeralResult)
+				m.drainQueuedStreamChunksRecordingQuota(ctx, auth, provider, resultModel, routeModel, execOpts, streamResult.Chunks, ephemeralResult)
 				return nil, errCtx
 			}
 			if allowRetry && !ephemeralResult {
@@ -342,6 +414,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					retryErr = markUpstreamExecutionAttemptFromContext(ctx, retryErr)
 					if retryErr != nil {
 						if errCtx := ctx.Err(); errCtx != nil {
+							m.recordCanceledStreamQuotaResult(ctx, auth, provider, resultModel, routeModel, execOpts, retryErr, ephemeralResult)
 							return nil, errCtx
 						}
 						bootstrapErr = retryErr

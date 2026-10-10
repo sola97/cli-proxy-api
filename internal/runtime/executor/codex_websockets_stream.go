@@ -272,6 +272,18 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if buffering {
 		for {
 			if ctx != nil && ctx.Err() != nil {
+				if quotaErr := e.takePendingQuotaError(sess, conn); quotaErr != nil {
+					if sess != nil {
+						sess.clearActive(conn, readCh)
+						unlockStreamSession()
+						if isEphemeralSession {
+							closeCodexWebsocketSession(sess, "upstream_error")
+						}
+					} else {
+						_ = closer.Close()
+					}
+					return nil, quotaErr
+				}
 				if sess != nil {
 					sess.clearActive(conn, readCh)
 					unlockStreamSession()
@@ -285,6 +297,18 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
 			if errRead != nil {
+				if quotaErr := e.takePendingQuotaError(sess, conn); quotaErr != nil {
+					if sess != nil {
+						sess.clearActive(conn, readCh)
+						unlockStreamSession()
+						if isEphemeralSession {
+							closeCodexWebsocketSession(sess, "upstream_error")
+						}
+					} else {
+						_ = closer.Close()
+					}
+					return nil, quotaErr
+				}
 				mappedErr := mapCodexWebsocketReadError(errRead)
 				if sess != nil {
 					e.invalidateUpstreamConn(sess, conn, "read_error", mappedErr)
@@ -351,6 +375,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				continue
 			}
+			if sess != nil {
+				sess.clearQuotaErrorPending(conn, payload)
+			}
 			observeCodexTokenEvent(reporter, payload)
 			helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
 			helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)
@@ -358,7 +385,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 			if wsErr, ok := parseCodexWebsocketErrorWithCooling(payload, e.modelLevelCooling()); ok {
 				if sess != nil {
-					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
+					e.invalidateUpstreamError(sess, conn, "upstream_error", wsErr)
 					sess.clearActive(conn, readCh)
 					unlockStreamSession()
 				} else {
@@ -395,7 +422,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					if failoverPending {
 						e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "terminal_failure", streamErr)
 					} else {
-						e.invalidateUpstreamConn(sess, conn, "terminal_failure", streamErr)
+						e.invalidateUpstreamError(sess, conn, "terminal_failure", streamErr)
 					}
 					sess.clearActive(conn, readCh)
 				} else {
@@ -505,6 +532,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if bootstrapTerminalErr != nil {
 		chanCapacity++
 	}
+	if chanCapacity == 0 {
+		chanCapacity = 1
+	}
 	out := make(chan cliproxyexecutor.StreamChunk, chanCapacity)
 	for _, chunk := range bufferedChunks {
 		out <- cliproxyexecutor.StreamChunk{Payload: chunk}
@@ -564,16 +594,26 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				out <- chunk
 				return true
 			}
+			if chunk.Err != nil && shouldDeferCodexQuotaDisconnectNotification(chunk.Err) {
+				out <- chunk
+				return true
+			}
 			select {
 			case out <- chunk:
 				return true
 			case <-ctx.Done():
+				e.deliverPendingQuotaError(sess, conn, out)
 				return false
 			}
 		}
 
 		for {
 			if ctx != nil && ctx.Err() != nil {
+				if quotaErr := e.deliverPendingQuotaError(sess, conn, out); quotaErr != nil {
+					terminateReason = "upstream_error"
+					terminateErr = quotaErr
+					return
+				}
 				terminateReason = "context_done"
 				terminateErr = ctx.Err()
 				_ = send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
@@ -582,6 +622,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
 			if errRead != nil {
 				if sess != nil && ctx != nil && ctx.Err() != nil {
+					if quotaErr := e.deliverPendingQuotaError(sess, conn, out); quotaErr != nil {
+						terminateReason = "upstream_error"
+						terminateErr = quotaErr
+						return
+					}
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()
 					_ = send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
@@ -615,6 +660,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if len(payload) == 0 {
 				continue
 			}
+			if sess != nil {
+				sess.clearQuotaErrorPending(conn, payload)
+			}
 			observeCodexTokenEvent(reporter, payload)
 			helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
 			helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)
@@ -624,7 +672,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
 				if sess != nil {
-					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
+					e.invalidateUpstreamError(sess, conn, "upstream_error", wsErr)
 				}
 				if errClearReplay := clearCodexReasoningReplayOnWebsocketError(ctx, replayScope, payload); errClearReplay != nil {
 					terminateErr = errClearReplay
@@ -643,7 +691,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				terminateErr = streamErr
 				if sess != nil {
 					unlockStreamSession()
-					e.invalidateUpstreamConn(sess, conn, "terminal_failure", streamErr)
+					e.invalidateUpstreamError(sess, conn, "terminal_failure", streamErr)
 				}
 				if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 					terminateErr = errClearReplay

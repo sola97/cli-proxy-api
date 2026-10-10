@@ -1083,6 +1083,115 @@ func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) 
 	}
 }
 
+func TestCodexWebsocketsQuotaErrorInvalidationDoesNotPreemptResult(t *testing.T) {
+	quotaErr, ok := parseCodexWebsocketErrorWithCooling([]byte(`{"type":"error","status":429,"error":{"type":"usage_limit_reached","resets_in_seconds":600}}`), false)
+	if !ok {
+		t.Fatal("expected a parsed Codex quota error")
+	}
+	if !shouldDeferCodexQuotaDisconnectNotification(quotaErr) {
+		t.Fatal("quota error with reset metadata should defer disconnect notification")
+	}
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	conn := &websocket.Conn{}
+	sess := &codexWebsocketSession{
+		conn:                 conn,
+		upstreamDisconnectCh: make(chan error, 1),
+	}
+	exec.invalidateUpstreamError(sess, conn, "upstream_error", quotaErr)
+	if sess.conn != nil {
+		t.Fatal("quota error should still invalidate the unhealthy upstream connection")
+	}
+	select {
+	case err := <-sess.upstreamDisconnectCh:
+		t.Fatalf("quota error preemptively notified downstream disconnect: %v", err)
+	default:
+	}
+
+	rateLimitErr, ok := parseCodexWebsocketErrorWithCooling([]byte(`{"type":"error","status":429,"error":{"type":"rate_limit_error","message":"slow down","resets_in_seconds":60}}`), false)
+	if !ok {
+		t.Fatal("expected a parsed rate limit error")
+	}
+	if shouldDeferCodexQuotaDisconnectNotification(rateLimitErr) {
+		t.Fatal("transient rate limit error must not defer disconnect notification")
+	}
+}
+
+func TestCodexWebsocketPendingQuotaSurvivesCancelBeforeRead(t *testing.T) {
+	payload := []byte(`{"type":"error","status":429,"error":{"type":"usage_limit_reached","resets_in_seconds":600}}`)
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if errWrite := conn.WriteMessage(websocket.TextMessage, payload); errWrite != nil {
+			t.Errorf("write quota event: %v", errWrite)
+		}
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = conn.Close() }()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	sess := &codexWebsocketSession{conn: conn, upstreamDisconnectCh: make(chan error, 1)}
+	sess.resetTerminalError(conn)
+	readCh := sess.activate(conn)
+	go exec.readUpstreamLoop(sess, conn)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if sess.quotaErrorPending(conn) && len(readCh) == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !sess.quotaErrorPending(conn) || len(readCh) != 1 {
+		t.Fatal("reader did not mark and queue the quota frame before cancellation")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if ctx.Err() != context.Canceled {
+		t.Fatal("test setup must cancel before delivering the queued quota frame")
+	}
+	out := make(chan cliproxyexecutor.StreamChunk, 1)
+	quotaErr := exec.deliverPendingQuotaError(sess, conn, out)
+	if quotaErr == nil || !shouldDeferCodexQuotaDisconnectNotification(quotaErr) {
+		t.Fatalf("pending confirmed quota error after cancellation = %v, want retryable 429 usage_limit_reached", quotaErr)
+	}
+	select {
+	case chunk := <-out:
+		if chunk.Err == nil || !shouldDeferCodexQuotaDisconnectNotification(chunk.Err) {
+			t.Fatalf("delivered chunk error = %v, want confirmed quota error", chunk.Err)
+		}
+	default:
+		t.Fatal("cancellation path did not deliver the pending quota error chunk")
+	}
+	if next := exec.takePendingQuotaError(sess, conn); next != nil {
+		t.Fatalf("pending quota payload should be consumed once, got %v", next)
+	}
+
+	pureCancellation := &codexWebsocketSession{terminalConn: conn}
+	if quotaErr := exec.takePendingQuotaError(pureCancellation, conn); quotaErr != nil {
+		t.Fatalf("pure client cancellation acquired a quota error: %v", quotaErr)
+	}
+	if len(readCh) != 1 {
+		t.Fatal("executor unexpectedly consumed the queued frame outside cancellation handling")
+	}
+	select {
+	case errDisconnect := <-sess.upstreamDisconnectCh:
+		t.Fatalf("confirmed quota triggered a downstream disconnect notification: %v", errDisconnect)
+	default:
+	}
+}
+
 func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) {
 	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, nil, "", nil, false)
 
@@ -2112,6 +2221,76 @@ func TestCodexWebsocketTerminalFailureInvalidatesRetainedLifecycle(t *testing.T)
 	}
 	if got := connections.Load(); got != 2 {
 		t.Fatalf("websocket connections = %d, want 2 after terminal invalidation", got)
+	}
+}
+
+func TestCodexWebsocketQuotaTerminalFailureDoesNotCancelDownstream(t *testing.T) {
+	for _, buffering := range []bool{true, false} {
+		t.Run(fmt.Sprintf("buffering=%t", buffering), func(t *testing.T) {
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			terminal := []byte(`{"type":"response.failed","response":{"status":"failed","error":{"type":"usage_limit_reached","code":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":600}}}`)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+				if errUpgrade != nil {
+					t.Errorf("upgrade websocket: %v", errUpgrade)
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				if _, _, errRead := conn.ReadMessage(); errRead != nil {
+					return
+				}
+				if errWrite := conn.WriteMessage(websocket.TextMessage, terminal); errWrite != nil {
+					t.Errorf("write terminal quota error: %v", errWrite)
+				}
+			}))
+			defer server.Close()
+
+			exec := NewCodexWebsocketsExecutor(&config.Config{
+				Codex:     config.CodexConfig{StreamBootstrapBuffering: buffering},
+				SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll},
+			})
+			exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+			sessionID := "quota-terminal-callback"
+			disconnectCh := exec.UpstreamDisconnectChan(sessionID)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			callbackDone := make(chan struct{})
+			go func() {
+				defer close(callbackDone)
+				select {
+				case <-disconnectCh:
+					cancel()
+				case <-ctx.Done():
+				}
+			}()
+
+			auth := &cliproxyauth.Auth{ID: "auth-quota-terminal", Provider: "codex", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+			req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`)}
+			opts := cliproxyexecutor.Options{
+				SourceFormat:   sdktranslator.FromString("openai-response"),
+				ResponseFormat: sdktranslator.FromString("openai-response"),
+				Metadata:       map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID},
+			}
+			result, errExecute := exec.ExecuteStream(ctx, auth, req, opts)
+			if errExecute != nil {
+				t.Fatalf("ExecuteStream() error = %v", errExecute)
+			}
+			var sawQuotaErr bool
+			for chunk := range result.Chunks {
+				if chunk.Err == nil {
+					continue
+				}
+				sawQuotaErr = strings.Contains(chunk.Err.Error(), "usage_limit_reached")
+			}
+			if !sawQuotaErr {
+				t.Fatal("stream lost its terminal quota error")
+			}
+			if errCtx := ctx.Err(); errCtx != nil {
+				t.Fatalf("upstream quota terminal canceled downstream context: %v", errCtx)
+			}
+			cancel()
+			<-callbackDone
+		})
 	}
 }
 

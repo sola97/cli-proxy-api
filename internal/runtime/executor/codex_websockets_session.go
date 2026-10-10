@@ -66,13 +66,15 @@ type codexWebsocketSession struct {
 
 	writeMu sync.Mutex
 
-	activeMu     sync.Mutex
-	activeConn   *websocket.Conn
-	activeCh     chan codexWebsocketRead
-	activeDone   <-chan struct{}
-	activeCancel context.CancelFunc
-	terminalConn *websocket.Conn
-	terminalErr  error
+	activeMu       sync.Mutex
+	activeConn     *websocket.Conn
+	activeCh       chan codexWebsocketRead
+	activeDone     <-chan struct{}
+	activeCancel   context.CancelFunc
+	terminalConn   *websocket.Conn
+	terminalErr    error
+	quotaErrorConn *websocket.Conn
+	quotaErrorBody []byte
 
 	responseStateConn   *websocket.Conn
 	terminalResponseIDs map[string]struct{}
@@ -144,11 +146,59 @@ func (s *codexWebsocketSession) resetTerminalError(conn *websocket.Conn) {
 	s.activeMu.Lock()
 	s.terminalConn = conn
 	s.terminalErr = nil
+	s.quotaErrorConn = nil
+	s.quotaErrorBody = nil
 	if s.responseStateConn != conn {
 		s.responseStateConn = conn
 		s.terminalResponseIDs = make(map[string]struct{})
 	}
 	s.activeMu.Unlock()
+}
+
+func (s *codexWebsocketSession) markQuotaErrorPending(conn *websocket.Conn, payload []byte) {
+	if s == nil || conn == nil {
+		return
+	}
+	s.activeMu.Lock()
+	if s.terminalConn == conn {
+		s.quotaErrorConn = conn
+		s.quotaErrorBody = append(s.quotaErrorBody[:0], payload...)
+	}
+	s.activeMu.Unlock()
+}
+
+func (s *codexWebsocketSession) takeQuotaErrorPending(conn *websocket.Conn) ([]byte, bool) {
+	if s == nil || conn == nil {
+		return nil, false
+	}
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	if s.quotaErrorConn != conn || len(s.quotaErrorBody) == 0 {
+		return nil, false
+	}
+	payload := s.quotaErrorBody
+	s.quotaErrorBody = nil
+	return payload, true
+}
+
+func (s *codexWebsocketSession) clearQuotaErrorPending(conn *websocket.Conn, payload []byte) {
+	if s == nil || conn == nil {
+		return
+	}
+	s.activeMu.Lock()
+	if s.quotaErrorConn == conn && bytes.Equal(s.quotaErrorBody, payload) {
+		s.quotaErrorBody = nil
+	}
+	s.activeMu.Unlock()
+}
+
+func (s *codexWebsocketSession) quotaErrorPending(conn *websocket.Conn) bool {
+	if s == nil || conn == nil {
+		return false
+	}
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	return s.quotaErrorConn == conn
 }
 
 func (s *codexWebsocketSession) markTerminalError(conn *websocket.Conn, err error) bool {
@@ -720,7 +770,11 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		if errRead != nil {
 			sess.markTerminalError(conn, errRead)
 			invalidate := func() {
-				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
+				if sess.quotaErrorPending(conn) {
+					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "upstream_disconnected", errRead)
+				} else {
+					e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
+				}
 			}
 			invalidated := false
 			ch, done := sess.activeForConn(conn)
@@ -761,6 +815,9 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 
 		payload = bytes.TrimSpace(payload)
 		if len(payload) > 0 {
+			if isCodexQuotaCooldownEvent(payload, e.modelLevelCooling()) {
+				sess.markQuotaErrorPending(conn, payload)
+			}
 			eventType := gjson.GetBytes(payload, "type").String()
 			if eventType != "" {
 				sess.setLastEventType(conn, eventType)

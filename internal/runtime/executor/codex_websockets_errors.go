@@ -2,17 +2,78 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+func shouldDeferCodexQuotaDisconnectNotification(err error) bool {
+	if err == nil || !isCodexUsageLimitError([]byte(err.Error())) {
+		return false
+	}
+	type retryableStatusError interface {
+		StatusCode() int
+		RetryAfter() *time.Duration
+	}
+	var statusErr retryableStatusError
+	return errors.As(err, &statusErr) && statusErr != nil && statusErr.StatusCode() == http.StatusTooManyRequests && statusErr.RetryAfter() != nil
+}
+
+func codexQuotaCooldownError(payload []byte, modelLevelCooling bool) error {
+	if err, ok := parseCodexWebsocketErrorWithCooling(payload, modelLevelCooling); ok && shouldDeferCodexQuotaDisconnectNotification(err) {
+		return err
+	}
+	err, _, ok := codexTerminalFailureErrWithCooling(payload, modelLevelCooling)
+	if ok && shouldDeferCodexQuotaDisconnectNotification(err) {
+		return err
+	}
+	return nil
+}
+
+func isCodexQuotaCooldownEvent(payload []byte, modelLevelCooling bool) bool {
+	return codexQuotaCooldownError(payload, modelLevelCooling) != nil
+}
+
+func (e *CodexWebsocketsExecutor) takePendingQuotaError(sess *codexWebsocketSession, conn *websocket.Conn) error {
+	if sess == nil {
+		return nil
+	}
+	payload, ok := sess.takeQuotaErrorPending(conn)
+	if !ok {
+		return nil
+	}
+	err := codexQuotaCooldownError(payload, e.modelLevelCooling())
+	if err != nil {
+		e.invalidateUpstreamError(sess, conn, "upstream_error", err)
+	}
+	return err
+}
+
+func (e *CodexWebsocketsExecutor) deliverPendingQuotaError(sess *codexWebsocketSession, conn *websocket.Conn, out chan<- cliproxyexecutor.StreamChunk) error {
+	err := e.takePendingQuotaError(sess, conn)
+	if err != nil {
+		out <- cliproxyexecutor.StreamChunk{Err: err}
+	}
+	return err
+}
+
+func (e *CodexWebsocketsExecutor) invalidateUpstreamError(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
+	if shouldDeferCodexQuotaDisconnectNotification(err) {
+		e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, reason, err)
+		return
+	}
+	e.invalidateUpstreamConn(sess, conn, reason, err)
+}
 
 type statusErrWithHeaders struct {
 	statusErr
