@@ -2,9 +2,9 @@
 
 > Execute in the current chat. The primary agent owns integration, validation, commit, push and deployment; workers own only the assigned files.
 
-**Goal:** Fix the Codex quota 404 and Grok quota 426 in issue #6504, and preserve confirmed WebSocket quota cooldown in issue #6503.
+**Goal:** Fix the Codex quota 404 in issue #6504 and preserve confirmed WebSocket quota cooldown in issue #6503. The user explicitly excluded Grok 426 from this task.
 
-**Architecture:** Register the existing quota handlers under the authenticated v8 management group. Align official xAI OAuth quota probe identity with the existing dynamic client version. Preserve scheduler recording of confirmed upstream quota errors when downstream disconnect cancels the request.
+**Architecture:** Register the existing quota handlers under the authenticated v8 management group. Preserve scheduler recording of confirmed upstream quota errors when downstream disconnect cancels the request.
 
 **Tech Stack:** Go 1.26, Gin, Docker in WSL Ubuntu-22.04; existing C ABI quota plugin.
 
@@ -28,16 +28,7 @@ Files: internal/api/server_management_v8.go; internal/api/server_management_v8_q
 - [ ] Register `v8.GET("/quota/providers", s.mgmt.GetQuotaProviders)`, `v8.POST("/quota/fetch", s.mgmt.FetchCredentialQuota)`, `v8.POST("/quota/reset", s.mgmt.ResetCredentialQuota)`.
 - [ ] Rerun route tests and existing v8 contract tests; commit and push with `fix(management): register v8 credential quota operations`.
 
-## Task 2: Grok quota request identity
-
-Files: internal/api/handlers/management/api_tools.go; internal/api/handlers/management/api_tools_xai_version_test.go.
-
-- [ ] Verify frontend quota constants and actual request flow.
-- [ ] Add a transport-level regression for stale identity, exact official destination, OAuth/API-key distinction and arbitrary passthrough preservation.
-- [ ] Reuse the existing dynamic Grok version for official OAuth probes; keep request identity headers coherent.
-- [ ] Run management API-call and xAI version tests; commit and push with `fix(xai): align management quota probe client version`.
-
-## Task 3: confirmed WebSocket quota cooldown
+## Task 2: confirmed WebSocket quota cooldown
 
 Files: sdk/cliproxy/auth/conductor_stream.go and targeted stream cancellation tests; executor WebSocket error handling only if required.
 
@@ -46,7 +37,7 @@ Files: sdk/cliproxy/auth/conductor_stream.go and targeted stream cancellation te
 - [ ] Run focused conductor/executor regressions and the synthetic mock reproduction from #6503 without production credentials.
 - [ ] Commit and push with `fix(codex): preserve websocket quota cooldown after disconnect`.
 
-## Task 4: build and deployment
+## Task 3: build and deployment
 
 - [ ] Run affected packages and compile cmd/server with CGO enabled in the WSL Go 1.26 builder.
 - [ ] Review final diff and run independent read-only reviewer.
