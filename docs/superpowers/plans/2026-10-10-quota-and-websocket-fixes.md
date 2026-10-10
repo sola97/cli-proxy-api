@@ -23,24 +23,26 @@
 
 Files: internal/api/server_management_v8.go; internal/api/server_management_v8_quota_test.go.
 
-- [ ] Add a route-level fixture implementing QuotaProvider; assert provider listing, normalized quota fetch, reset, validation and access control through /v8/management/quota/*.
-- [ ] Run `go test ./internal/api -run TestManagementV8Quota -count=1`; confirm the unpatched route fails with 404.
-- [ ] Register `v8.GET("/quota/providers", s.mgmt.GetQuotaProviders)`, `v8.POST("/quota/fetch", s.mgmt.FetchCredentialQuota)`, `v8.POST("/quota/reset", s.mgmt.ResetCredentialQuota)`.
-- [ ] Rerun route tests and existing v8 contract tests; commit and push with `fix(management): register v8 credential quota operations`.
+- [x] Add a route-level fixture implementing QuotaProvider; assert provider listing, normalized quota fetch, reset, validation and access control through /v8/management/quota/*.
+- [x] Run `go test ./internal/api -run TestManagementV8Quota -count=1`; confirm the unpatched route fails with 404.
+- [x] Register `v8.GET("/quota/providers", s.mgmt.GetQuotaProviders)`, `v8.POST("/quota/fetch", s.mgmt.FetchCredentialQuota)`, `v8.POST("/quota/reset", s.mgmt.ResetCredentialQuota)`.
+- [x] Rerun route tests and existing v8 contract tests; commit and push with `fix(management): register v8 credential quota operations`.
 
 ## Task 2: confirmed WebSocket quota cooldown
 
 Files: sdk/cliproxy/auth/conductor_stream.go and targeted stream cancellation tests; executor WebSocket error handling only if required.
 
-- [ ] Reproduce canceled context before confirmed error recording and assert credential cooldown plus subsequent selection exclusion.
-- [ ] Cover ordinary cancellation/EOF, model-level cooling and healthy credential routing.
-- [ ] Run focused conductor/executor regressions and the synthetic mock reproduction from #6503 without production credentials.
-- [ ] Commit and push with `fix(codex): preserve websocket quota cooldown after disconnect`.
+- [x] Reproduce canceled context before confirmed error recording and assert credential cooldown plus subsequent selection exclusion.
+- [x] Cover ordinary cancellation/EOF, model-level cooling and healthy credential routing.
+- [x] Run focused conductor/executor regressions and the synthetic mock reproduction from #6503 without production credentials.
+- [x] Commit and push with `fix(codex): preserve websocket quota cooldown after disconnect`.
 
 ## Task 3: build and deployment
 
-- [ ] Run affected packages and compile cmd/server with CGO enabled in the WSL Go 1.26 builder.
-- [ ] Review final diff and run independent read-only reviewer.
-- [ ] Build a versioned amd64 image; load it on bandwagon and switch compose only after backup.
-- [ ] Verify version, quota plugin load, HTTP models and authenticated real quota refresh for active Codex credentials.
-- [ ] Record artifact identifiers, commands, results and limitations in a deployment report; commit and push docs.
+- [x] Run affected packages and compile cmd/server with CGO enabled in the WSL Go 1.26 builder.
+- [x] Review final diff and run independent read-only reviewer.
+- [x] Build a versioned amd64 image; pull it on bandwagon and switch compose only after backup.
+- [x] Verify version, quota plugin load, model catalog in the management page and authenticated real quota refresh for active Codex credentials.
+- [x] Record artifact identifiers, commands, results and limitations in a deployment report; commit and push docs.
+
+See [the deployment report](../../codex-hotfix-2026-10-10.md) for image identifiers, verification evidence, rollback and remaining validation limits.
