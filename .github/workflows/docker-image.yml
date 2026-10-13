@@ -48,6 +48,8 @@ jobs:
             ${{ env.DOCKERHUB_REPO }}:latest-amd64
             ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}-amd64
 
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: 'false'
   docker_arm64:
     runs-on: ubuntu-24.04-arm
     steps:
@@ -86,6 +88,8 @@ jobs:
             ${{ env.DOCKERHUB_REPO }}:latest-arm64
             ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}-arm64
 
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: 'false'
   docker_manifest:
     runs-on: ubuntu-latest
     needs:

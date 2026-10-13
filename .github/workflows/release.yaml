@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 env:
   GH_REPO: ${{ github.repository }}
@@ -188,6 +189,7 @@ jobs:
           name: ${{ matrix.target }}
           path: dist/CLIProxyAPI_*
           if-no-files-found: error
+          retention-days: 7
       - name: Upload release assets
         shell: bash
         env:
@@ -324,6 +326,7 @@ jobs:
           name: ${{ matrix.target }}
           path: dist/CLIProxyAPI_*
           if-no-files-found: error
+          retention-days: 7
       - name: Upload release assets
         shell: bash
         env:
@@ -443,6 +446,7 @@ jobs:
           name: ${{ matrix.target }}
           path: dist/CLIProxyAPI_*
           if-no-files-found: error
+          retention-days: 7
       - name: Upload release assets
         shell: bash
         env:
@@ -644,6 +648,7 @@ jobs:
           name: ${{ matrix.target }}
           path: dist/CLIProxyAPI_*
           if-no-files-found: error
+          retention-days: 7
       - name: Upload release assets
         shell: bash
         env:
@@ -697,7 +702,128 @@ jobs:
       - build-linux-no-plugin
       - build-freebsd
     steps:
+      - name: Restore consolidated artifacts on job rerun
+        id: restore_retained_artifacts
+        if: ${{ github.run_attempt > 1 }}
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const path = require('node:path');
+            const os = require('node:os');
+            async function restoreRetainedArtifacts({
+              github,
+              context,
+              core,
+              exec,
+              owner = context.repo.owner,
+              repo = context.repo.repo,
+              desiredName = '',
+              pattern = '',
+              targetPath,
+              mergeMultiple = false,
+              explicitName = false,
+              tempRoot = process.env.RUNNER_TEMP || os.tmpdir(),
+              fs = require('node:fs'),
+            }) {
+              if (context.runAttempt <= 1) {
+                core.setOutput('restored', 'false');
+                return false;
+              }
+            
+              const runArtifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+                owner,
+                repo,
+                run_id: context.runId,
+                per_page: 100,
+              });
+              const matches = (name) => {
+                if (desiredName) return name === desiredName;
+                if (pattern) {
+                  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+                  const expression = new RegExp(`^${escaped.replace(/\*/g, '.*').replace(/\?/g, '.')}$`);
+                  return expression.test(name);
+                }
+                return true;
+              };
+              if (runArtifacts.some((artifact) => !artifact.expired && matches(artifact.name))) {
+                core.info('Matching current-run artifacts are available; keeping the normal download step.');
+                core.setOutput('restored', 'false');
+                return false;
+              }
+            
+              const repositoryName = `${owner}/${repo}`;
+              const repositoryArtifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
+                owner,
+                repo,
+                per_page: 100,
+              });
+              const candidates = [];
+              for (const artifact of repositoryArtifacts) {
+                const match = /^latest-run-(\d+)-(\d+)-(\d+)$/.exec(artifact.name);
+                if (!match || Number(match[1]) !== Number(context.runId) || artifact.expired || !artifact.workflow_run?.id) continue;
+                const retentionRun = (await github.rest.actions.getWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: artifact.workflow_run.id,
+                })).data;
+                if (retentionRun.status !== 'completed' ||
+                    retentionRun.path !== '.github/workflows/artifact-retention.yml' ||
+                    retentionRun.repository?.full_name !== repositoryName) continue;
+                candidates.push({ artifact, sourceCreatedAt: Number(match[2]), sourceAttempt: Number(match[3]) });
+              }
+              candidates.sort((left, right) =>
+                right.sourceCreatedAt - left.sourceCreatedAt ||
+                right.sourceAttempt - left.sourceAttempt ||
+                Date.parse(right.artifact.created_at) - Date.parse(left.artifact.created_at)
+              );
+              if (candidates.length === 0) {
+                throw new Error(`No retained artifact bundle from .github/workflows/artifact-retention.yml matches source run ${context.runId}.`);
+              }
+            
+              const bundle = candidates[0].artifact;
+              const outerZip = path.join(tempRoot, `retained-${context.runId}.zip`);
+              const outerDir = path.join(tempRoot, `retained-${context.runId}`);
+              fs.mkdirSync(outerDir, { recursive: true });
+              const archive = await github.rest.actions.downloadArtifact({
+                owner,
+                repo,
+                artifact_id: bundle.id,
+                archive_format: 'zip',
+              });
+              fs.writeFileSync(outerZip, Buffer.from(archive.data));
+              await exec.exec('unzip', ['-q', '-o', outerZip, '-d', outerDir]);
+            
+              const manifestPath = path.join(outerDir, 'manifest.json');
+              if (!fs.existsSync(manifestPath)) throw new Error(`Retained bundle ${bundle.name} has no manifest.json.`);
+              const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+              if (Number(manifest.sourceRunId) !== Number(context.runId) || !Array.isArray(manifest.artifacts)) {
+                throw new Error(`Retained bundle ${bundle.name} does not describe source run ${context.runId}.`);
+              }
+              const selected = manifest.artifacts.filter((item) => item && typeof item.name === 'string' && matches(item.name));
+              if (selected.length === 0) {
+                throw new Error(`Retained bundle ${bundle.name} contains no artifact matching ${desiredName || pattern || '*'} for run ${context.runId}.`);
+              }
+            
+              const destination = path.resolve(targetPath);
+              fs.mkdirSync(destination, { recursive: true });
+              for (const item of selected) {
+                if (typeof item.filename !== 'string' || path.basename(item.filename) !== item.filename || !item.filename.endsWith('.zip')) {
+                  throw new Error(`Retained bundle ${bundle.name} contains an invalid archive filename.`);
+                }
+                const innerZip = path.join(outerDir, item.filename);
+                if (!fs.existsSync(innerZip)) throw new Error(`Retained bundle ${bundle.name} is missing ${item.filename}.`);
+                const artifactPath = mergeMultiple || explicitName ? destination : path.join(destination, item.name);
+                fs.mkdirSync(artifactPath, { recursive: true });
+                await exec.exec('unzip', ['-q', '-o', innerZip, '-d', artifactPath]);
+                core.info(`Restored artifact ${item.name} to ${artifactPath}`);
+              }
+            
+              core.setOutput('restored', 'true');
+              return true;
+            }
+            await restoreRetainedArtifacts({ github, context, core, exec, ...{"targetPath":"dist","mergeMultiple":true} });
       - uses: actions/download-artifact@v4
+        if: ${{ steps.restore_retained_artifacts.outputs.restored != 'true' }}
         with:
           path: dist
           merge-multiple: true
