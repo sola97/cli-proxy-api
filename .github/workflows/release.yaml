@@ -800,7 +800,8 @@ jobs:
               if (Number(manifest.sourceRunId) !== Number(context.runId) || !Array.isArray(manifest.artifacts)) {
                 throw new Error(`Retained bundle ${bundle.name} does not describe source run ${context.runId}.`);
               }
-              const selected = manifest.artifacts.filter((item) => item && typeof item.name === 'string' && matches(item.name));
+              const currentNames = new Set(currentArtifacts.map((artifact) => artifact.name));
+              const selected = manifest.artifacts.filter((item) => item && typeof item.name === 'string' && matches(item.name) && !currentNames.has(item.name));
               if (selected.length === 0 && currentArtifacts.length === 0) {
                 throw new Error(`Retained bundle ${bundle.name} contains no artifact matching ${desiredName || pattern || '*'} for run ${context.runId}.`);
               }
@@ -814,8 +815,7 @@ jobs:
                 core.info(`Restored artifact ${artifactName} to ${artifactPath}`);
               };
             
-              // Restore the complete retained set first; newer artifacts from this retry
-              // are extracted afterwards so they replace stale files with the same name.
+              // New artifacts replace the entire old artifact with that name, including removed files.
               for (const item of selected) {
                 if (typeof item.filename !== 'string' || path.basename(item.filename) !== item.filename || !item.filename.endsWith('.zip')) {
                   throw new Error(`Retained bundle ${bundle.name} contains an invalid archive filename.`);
