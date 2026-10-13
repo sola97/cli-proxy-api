@@ -745,11 +745,7 @@ jobs:
                 }
                 return true;
               };
-              if (runArtifacts.some((artifact) => !artifact.expired && matches(artifact.name))) {
-                core.info('Matching current-run artifacts are available; keeping the normal download step.');
-                core.setOutput('restored', 'false');
-                return false;
-              }
+              const currentArtifacts = runArtifacts.filter((artifact) => !artifact.expired && matches(artifact.name));
             
               const repositoryName = `${owner}/${repo}`;
               const repositoryArtifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
@@ -777,6 +773,11 @@ jobs:
                 Date.parse(right.artifact.created_at) - Date.parse(left.artifact.created_at)
               );
               if (candidates.length === 0) {
+                if (currentArtifacts.length > 0) {
+                  core.info('No retained bundle is available; current-run artifacts remain available for the normal download step.');
+                  core.setOutput('restored', 'false');
+                  return false;
+                }
                 throw new Error(`No retained artifact bundle from .github/workflows/artifact-retention.yml matches source run ${context.runId}.`);
               }
             
@@ -800,22 +801,39 @@ jobs:
                 throw new Error(`Retained bundle ${bundle.name} does not describe source run ${context.runId}.`);
               }
               const selected = manifest.artifacts.filter((item) => item && typeof item.name === 'string' && matches(item.name));
-              if (selected.length === 0) {
+              if (selected.length === 0 && currentArtifacts.length === 0) {
                 throw new Error(`Retained bundle ${bundle.name} contains no artifact matching ${desiredName || pattern || '*'} for run ${context.runId}.`);
               }
             
               const destination = path.resolve(targetPath);
               fs.mkdirSync(destination, { recursive: true });
+              const extractArtifact = async (artifactName, archivePath) => {
+                const artifactPath = mergeMultiple || explicitName ? destination : path.join(destination, artifactName);
+                fs.mkdirSync(artifactPath, { recursive: true });
+                await exec.exec('unzip', ['-q', '-o', archivePath, '-d', artifactPath]);
+                core.info(`Restored artifact ${artifactName} to ${artifactPath}`);
+              };
+            
+              // Restore the complete retained set first; newer artifacts from this retry
+              // are extracted afterwards so they replace stale files with the same name.
               for (const item of selected) {
                 if (typeof item.filename !== 'string' || path.basename(item.filename) !== item.filename || !item.filename.endsWith('.zip')) {
                   throw new Error(`Retained bundle ${bundle.name} contains an invalid archive filename.`);
                 }
                 const innerZip = path.join(outerDir, item.filename);
                 if (!fs.existsSync(innerZip)) throw new Error(`Retained bundle ${bundle.name} is missing ${item.filename}.`);
-                const artifactPath = mergeMultiple || explicitName ? destination : path.join(destination, item.name);
-                fs.mkdirSync(artifactPath, { recursive: true });
-                await exec.exec('unzip', ['-q', '-o', innerZip, '-d', artifactPath]);
-                core.info(`Restored artifact ${item.name} to ${artifactPath}`);
+                await extractArtifact(item.name, innerZip);
+              }
+              for (const artifact of currentArtifacts) {
+                const archivePath = path.join(outerDir, `current-${artifact.id}.zip`);
+                const currentArchive = await github.rest.actions.downloadArtifact({
+                  owner,
+                  repo,
+                  artifact_id: artifact.id,
+                  archive_format: 'zip',
+                });
+                fs.writeFileSync(archivePath, Buffer.from(currentArchive.data));
+                await extractArtifact(artifact.name, archivePath);
               }
             
               core.setOutput('restored', 'true');
